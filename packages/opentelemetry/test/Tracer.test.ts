@@ -1,10 +1,13 @@
 import * as NodeSdk from "@effect/opentelemetry/NodeSdk"
+import * as OtlpTracer from "@effect/opentelemetry/OtlpTracer"
 import * as Tracer from "@effect/opentelemetry/Tracer"
+import { HttpClient } from "@effect/platform"
 import { assert, describe, expect, it } from "@effect/vitest"
 import * as OtelApi from "@opentelemetry/api"
 import { AsyncHooksContextManager } from "@opentelemetry/context-async-hooks"
 import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
 import * as Runtime from "effect/Runtime"
 import { OtelSpan } from "../src/internal/tracer.js"
 
@@ -77,6 +80,20 @@ describe("Tracer", () => {
         TracingLive
       ))
 
+    it.effect("currentSpanContext", () =>
+      Effect.provide(
+        Effect.withSpan("ok")(
+          Effect.gen(function*() {
+            const span = yield* Effect.currentSpan
+            const spanContext = yield* Tracer.currentSpanContext
+            expect(spanContext.traceId).toBe(span.traceId)
+            expect(spanContext.spanId).toBe(span.spanId)
+            expect(spanContext.traceFlags).toBe(OtelApi.TraceFlags.SAMPLED)
+          })
+        ),
+        TracingLive
+      ))
+
     it.scoped("withSpanContext", () =>
       Effect.gen(function*() {
         const effect = Effect.gen(function*() {
@@ -121,6 +138,52 @@ describe("Tracer", () => {
           const span = yield* Effect.currentSpan
           expect(span).not.instanceOf(OtelSpan)
         })
+      ))
+  })
+
+  describe("OTLP tracer", () => {
+    const MockHttpClient = Layer.succeed(
+      HttpClient.HttpClient,
+      HttpClient.make(() => Effect.die("mock http client"))
+    )
+    const OtlpTracingLive = OtlpTracer.layer({
+      url: "http://localhost:4318/v1/traces",
+      resource: {
+        serviceName: "test-otlp"
+      }
+    }).pipe(Layer.provide(MockHttpClient))
+
+    it.effect("currentSpanContext works with OTLP tracer", () =>
+      Effect.provide(
+        Effect.withSpan("ok")(
+          Effect.gen(function*() {
+            const span = yield* Effect.currentSpan
+            const spanContext = yield* Tracer.currentSpanContext
+            expect(spanContext.traceId).toBe(span.traceId)
+            expect(spanContext.spanId).toBe(span.spanId)
+            expect(spanContext.traceFlags).toBe(OtelApi.TraceFlags.SAMPLED)
+            expect(spanContext.isRemote).toBe(false)
+          })
+        ),
+        OtlpTracingLive
+      ))
+
+    it.effect("currentOtelSpan works with OTLP tracer", () =>
+      Effect.provide(
+        Effect.withSpan("ok")(
+          Effect.gen(function*() {
+            const span = yield* Effect.currentSpan
+            const otelSpan = yield* Tracer.currentOtelSpan
+            const spanContext = otelSpan.spanContext()
+            expect(spanContext.traceId).toBe(span.traceId)
+            expect(spanContext.spanId).toBe(span.spanId)
+            expect(spanContext.traceFlags).toBe(OtelApi.TraceFlags.SAMPLED)
+            expect(spanContext.isRemote).toBe(false)
+            // OTLP spans return a read-only wrapper
+            expect(otelSpan.isRecording()).toBe(false)
+          })
+        ),
+        OtlpTracingLive
       ))
   })
 })

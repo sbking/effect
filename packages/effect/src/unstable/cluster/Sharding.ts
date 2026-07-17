@@ -466,7 +466,26 @@ const make = Effect.gen(function*() {
     const entityRegistrationTimeoutMillis = Duration.toMillis(
       Duration.fromInputUnsafe(config.entityRegistrationTimeout)
     )
+    const entityMessagePollIntervalMillis = Duration.toMillis(
+      Duration.fromInputUnsafe(config.entityMessagePollInterval)
+    )
     const storageStartMillis = clock.currentTimeMillisUnsafe()
+    const storageReadWake = yield* FiberMap.make<string>()
+    const scheduleStorageRead = Effect.fnUntraced(function*(nextDeliverAt: Option.Option<number>) {
+      const delay = Option.match(nextDeliverAt, {
+        onNone: () => entityMessagePollIntervalMillis,
+        onSome: (deliverAt) =>
+          Math.min(
+            entityMessagePollIntervalMillis,
+            Math.max(0, deliverAt - clock.currentTimeMillisUnsafe())
+          )
+      })
+      yield* FiberMap.run(
+        storageReadWake,
+        "poll",
+        storageReadLatch.open.pipe(Effect.delay(delay))
+      )
+    })
 
     yield* Effect.gen(function*() {
       yield* Effect.logDebug("Starting")
@@ -563,6 +582,9 @@ const make = Effect.gen(function*() {
         // next iteration
         storageReadLatch.closeUnsafe()
 
+        // retain polling as the fallback if the storage read fails
+        yield* scheduleStorageRead(Option.none())
+
         // the lock is used to ensure resuming entities have a garantee that no
         // more items are added to the unprocessed set while the semaphore is
         // acquired.
@@ -573,7 +595,9 @@ const make = Effect.gen(function*() {
           pendingNotifications.forEach((entry) => removableNotifications.add(entry))
         }
 
-        messages = yield* storage.unprocessedMessages(acquiredShards)
+        const unprocessed = yield* storage.unprocessedMessages(acquiredShards)
+        messages = unprocessed.messages
+        yield* scheduleStorageRead(unprocessed.nextDeliverAt)
         index = 0
         yield* processMessages
 
@@ -607,13 +631,6 @@ const make = Effect.gen(function*() {
         fiber: "Storage read loop",
         runner: selfAddress
       }),
-      Effect.forkIn(shardingScope)
-    )
-
-    // open the storage latch every poll interval
-    yield* storageReadLatch.open.pipe(
-      Effect.delay(config.entityMessagePollInterval),
-      Effect.forever,
       Effect.forkIn(shardingScope)
     )
 

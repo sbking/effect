@@ -49,14 +49,14 @@ describe("SqlMessageStorage", () => {
 
           yield* storage.saveReply(yield* makeReply(request))
 
-          let messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+          let messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
           expect(messages).toHaveLength(4)
           expect(messages.map((m: any) => m.envelope.payload.id)).toEqual([2, 3, 4, 5])
 
           for (let i = 6; i <= 10; i++) {
             yield* storage.saveRequest(yield* makeRequest({ payload: { id: i } }))
           }
-          messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+          messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
           expect(messages).toHaveLength(5)
           expect(messages.map((m: any) => m.envelope.payload.id)).toEqual([6, 7, 8, 9, 10])
         }))
@@ -142,12 +142,12 @@ describe("SqlMessageStorage", () => {
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
-          let messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+          let messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
           expect(messages).toHaveLength(1)
-          messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+          messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
           expect(messages).toHaveLength(0)
           yield* storage.saveRequest(yield* makeRequest())
-          messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+          messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
           expect(messages).toHaveLength(1)
         }))
 
@@ -159,7 +159,7 @@ describe("SqlMessageStorage", () => {
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
           yield* storage.saveReply(yield* makeReply(request))
-          const messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+          const messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
           expect(messages).toHaveLength(0)
         }))
 

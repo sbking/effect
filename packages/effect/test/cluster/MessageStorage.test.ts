@@ -29,7 +29,7 @@ describe("MessageStorage", () => {
         const request = yield* makeRequest()
         const result = yield* storage.saveRequest(request)
         expect(result._tag).toEqual("Success")
-        const messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+        const messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
         expect(messages).toHaveLength(1)
       }).pipe(Effect.provide(MemoryLive)))
 
@@ -57,7 +57,7 @@ describe("MessageStorage", () => {
         const request = yield* makeRequest()
         yield* storage.saveRequest(request)
         yield* storage.saveReply(yield* makeReply(request))
-        const messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+        const messages = (yield* storage.unprocessedMessages([request.envelope.address.shardId])).messages
         expect(messages).toHaveLength(0)
       }).pipe(Effect.provide(MemoryLive)))
 

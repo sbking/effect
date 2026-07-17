@@ -34,6 +34,26 @@ import type { ShardingConfig } from "./ShardingConfig.ts"
 import * as Snowflake from "./Snowflake.ts"
 
 /**
+ * Unprocessed messages and the earliest future delivery time for a storage read.
+ *
+ * @since 4.0.0
+ */
+export interface UnprocessedMessages<A> {
+  readonly messages: Array<A>
+  readonly nextDeliverAt: Option.Option<number>
+}
+
+/**
+ * Encoded unprocessed messages and their earliest future delivery time.
+ *
+ * @since 4.0.0
+ */
+export interface UnprocessedMessagesEncoded<A> {
+  readonly messages: Array<A>
+  readonly nextDeliverAt: number | null
+}
+
+/**
  * Service for cluster mailbox persistence and reply delivery.
  *
  * **Details**
@@ -134,7 +154,7 @@ export class MessageStorage extends Context.Service<MessageStorage, {
    */
   readonly unprocessedMessages: (
     shardIds: Iterable<ShardId.ShardId>
-  ) => Effect.Effect<Array<Message.Incoming<any>>, PersistenceError>
+  ) => Effect.Effect<UnprocessedMessages<Message.Incoming<any>>, PersistenceError>
 
   /**
    * Retrieves the unprocessed messages by id.
@@ -354,7 +374,7 @@ export type Encoded = {
     shardIds: Arr.NonEmptyArray<string>,
     now: number
   ) => Effect.Effect<
-    Array<{
+    UnprocessedMessagesEncoded<{
       readonly envelope: Envelope.Encoded
       readonly lastSentReply: Option.Option<Reply.Encoded>
     }>,
@@ -636,10 +656,16 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
     unprocessedMessages(shardIds) {
       const storage = this as MessageStorage["Service"]
       const shards = Array.from(shardIds, (id) => id.toString())
-      if (!Arr.isArrayNonEmpty(shards)) return Effect.succeed([])
+      if (!Arr.isArrayNonEmpty(shards)) {
+        return Effect.succeed({ messages: [], nextDeliverAt: Option.none() })
+      }
       return Effect.flatMap(
         Effect.suspend(() => encoded.unprocessedMessages(shards, clock.currentTimeMillisUnsafe())),
-        (messages) => decodeMessages(storage, messages)
+        (result) =>
+          Effect.map(decodeMessages(storage, result.messages), (messages) => ({
+            messages,
+            nextDeliverAt: Option.fromNullishOr(result.nextDeliverAt)
+          }))
       )
     },
     unprocessedMessagesById(messageIds) {
@@ -777,7 +803,7 @@ export const noop: MessageStorage["Service"] = Effect.runSync(make({
   repliesFor: () => Effect.succeed([]),
   repliesForUnfiltered: () => Effect.succeed([]),
   requestIdForPrimaryKey: () => Effect.succeedNone,
-  unprocessedMessages: () => Effect.succeed([]),
+  unprocessedMessages: () => Effect.succeed({ messages: [], nextDeliverAt: Option.none() }),
   unprocessedMessagesById: () => Effect.succeed([]),
   resetAddress: () => Effect.void,
   clearAddress: () => Effect.void,
@@ -953,12 +979,13 @@ export class MemoryDriver extends Context.Service<MemoryDriver>()("effect/cluste
         Effect.sync(() => requestIds.flatMap((id) => requests.get(String(id))?.replies ?? [])),
       unprocessedMessages: (shardIds) =>
         Effect.sync(() => {
-          if (unprocessed.size === 0) return []
+          if (unprocessed.size === 0) return { messages: [], nextDeliverAt: null }
           const now = clock.currentTimeMillisUnsafe()
           const messages = Arr.empty<{
             envelope: Envelope.Encoded
             lastSentReply: Option.Option<Reply.Encoded>
           }>()
+          let nextDeliverAt: number | null = null
           for (let index = 0; index < journal.length; index++) {
             const envelope = journal[index]
             const shardId = ShardId.make(envelope.address.shardId.group, envelope.address.shardId.id)
@@ -967,7 +994,10 @@ export class MemoryDriver extends Context.Service<MemoryDriver>()("effect/cluste
             }
             if (envelope._tag === "Request") {
               const entry = requests.get(envelope.requestId)!
-              if (entry.deliverAt && entry.deliverAt > now) {
+              if (entry.deliverAt != null && entry.deliverAt > now) {
+                if (nextDeliverAt === null || entry.deliverAt < nextDeliverAt) {
+                  nextDeliverAt = entry.deliverAt
+                }
                 continue
               }
               messages.push({
@@ -982,7 +1012,7 @@ export class MemoryDriver extends Context.Service<MemoryDriver>()("effect/cluste
               unprocessed.delete(envelope)
             }
           }
-          return messages
+          return { messages, nextDeliverAt }
         }),
       unprocessedMessagesById: (ids) =>
         Effect.sync(() => {

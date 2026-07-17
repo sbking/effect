@@ -31,6 +31,23 @@ import * as Snowflake from "./Snowflake.ts"
 
 const withTracerDisabled = Effect.withTracerEnabled(false)
 
+const causeProperty = (cause: unknown, property: string): unknown =>
+  typeof cause === "object" && cause !== null && property in cause ? Reflect.get(cause, property) : undefined
+
+const isPgConcurrentIndexRace = (error: SqlError): boolean => {
+  const cause = error.reason.cause
+  return causeProperty(cause, "code") === "23505" &&
+    causeProperty(cause, "schema") === "pg_catalog" &&
+    causeProperty(cause, "table") === "pg_class" &&
+    causeProperty(cause, "constraint") === "pg_class_relname_nsp_index"
+}
+
+const isMysqlDuplicateKeyName = (error: SqlError): boolean => {
+  return causeProperty(error.reason.cause, "errno") === 1061
+}
+
+const isMssqlConcurrentIndexRace = (error: SqlError): boolean => causeProperty(error.reason.cause, "number") === 1913
+
 /**
  * Creates a SQL-backed `MessageStorage` implementation, running its migrations
  * and using the optional table prefix.
@@ -80,6 +97,52 @@ export const make: (options?: {
 
   const messagesTable = table("messages")
   const messagesTableSql = sql(messagesTable)
+  const deliverAtLookupIndex = `${messagesTable}_deliver_at_idx`
+
+  const ensureIndexes = sql.onDialectOrElse({
+    pg: () =>
+      sql`
+        CREATE INDEX IF NOT EXISTS ${sql(deliverAtLookupIndex)}
+        ON ${messagesTableSql} (shard_id, processed, deliver_at, last_read)
+      `.pipe(Effect.catchIf(isPgConcurrentIndexRace, () => Effect.void)),
+    sqlite: () =>
+      sql`
+        CREATE INDEX IF NOT EXISTS ${sql(deliverAtLookupIndex)}
+        ON ${messagesTableSql} (shard_id, processed, deliver_at, last_read)
+      `,
+    mysql: () =>
+      Effect.gen(function*() {
+        const existing = yield* sql<{ readonly present: number }>`
+          SELECT 1 AS present
+          FROM information_schema.statistics
+          WHERE table_schema = DATABASE()
+            AND table_name = ${messagesTable}
+            AND index_name = ${deliverAtLookupIndex}
+          LIMIT 1
+        `
+        if (existing.length > 0) {
+          return
+        }
+        yield* sql`
+          CREATE INDEX ${sql(deliverAtLookupIndex)}
+          ON ${messagesTableSql} (shard_id, processed, deliver_at, last_read)
+        `.unprepared.pipe(Effect.catchIf(isMysqlDuplicateKeyName, () => Effect.void))
+      }),
+    mssql: () =>
+      sql`
+        IF NOT EXISTS (
+          SELECT 1
+          FROM sys.indexes
+          WHERE object_id = OBJECT_ID(${sql.literal(`N'${messagesTable}'`)})
+            AND name = ${deliverAtLookupIndex}
+        )
+          CREATE INDEX ${sql(deliverAtLookupIndex)}
+          ON ${messagesTableSql} (shard_id, processed, deliver_at, last_read);
+      `.unprepared.pipe(Effect.catchIf(isMssqlConcurrentIndexRace, () => Effect.void)),
+    orElse: () => Effect.void
+  })
+
+  yield* Effect.orDie(ensureIndexes)
 
   const repliesTable = table("replies")
   const repliesTableSql = sql(repliesTable)
@@ -403,6 +466,61 @@ export const make: (options?: {
       )
   })
 
+  const getNextDeliverAt = sql.onDialectOrElse({
+    mysql: () => (shardIds: ReadonlyArray<string>, now: number) =>
+      sql<{ next_deliver_at: string | number | bigint | null }>`
+        SELECT MIN(deadlines.next_deliver_at) AS next_deliver_at
+        FROM (
+          ${
+        sql.join(" UNION ALL ", false)(
+          shardIds.map((shardId) =>
+            sql`(SELECT MIN(deliver_at) AS next_deliver_at
+                FROM ${messagesTableSql}
+                WHERE shard_id = ${sql.literal(wrapString(shardId))}
+                AND processed = ${sqlFalse}
+                AND deliver_at > ${sql.literal(String(now))})`
+          )
+        )
+      }
+        ) deadlines
+      `.unprepared,
+    sqlite: () => (shardIds: ReadonlyArray<string>, now: number) =>
+      sql<{ next_deliver_at: string | number | bigint | null }>`
+        WITH assigned_shards(shard_id) AS (
+          VALUES ${sql.literal(shardIds.map((shardId) => `(${wrapString(shardId)})`).join(","))}
+        )
+        SELECT MIN(deadlines.next_deliver_at) AS next_deliver_at
+        FROM (
+          SELECT (
+            SELECT MIN(m.deliver_at)
+            FROM ${messagesTableSql} m
+            WHERE m.shard_id = s.shard_id
+            AND m.processed = ${sqlFalse}
+            AND m.deliver_at > ${sql.literal(String(now))}
+          ) AS next_deliver_at
+          FROM assigned_shards s
+        ) deadlines
+      `.unprepared,
+    orElse: () => (shardIds: ReadonlyArray<string>, now: number) =>
+      sql<{ next_deliver_at: string | number | bigint | null }>`
+        SELECT MIN(deadlines.next_deliver_at) AS next_deliver_at
+        FROM (
+          SELECT (
+            SELECT MIN(m.deliver_at)
+            FROM ${messagesTableSql} m
+            WHERE m.shard_id = s.shard_id
+            AND m.processed = ${sqlFalse}
+            AND m.deliver_at > ${sql.literal(String(now))}
+          ) AS next_deliver_at
+          FROM (VALUES ${
+        sql.literal(
+          shardIds.map((shardId) => `(${wrapString(shardId)})`).join(",")
+        )
+      }) AS s(shard_id)
+        ) deadlines
+      `.unprepared
+  })
+
   return yield* MessageStorage.makeEncoded({
     saveEnvelope: ({ deliverAt, envelope, primaryKey }) =>
       Effect.suspend(() => {
@@ -535,9 +653,7 @@ export const make: (options?: {
     unprocessedMessages: Effect.fnUntraced(
       function*(shardIds, now) {
         const rows = yield* getUnprocessedMessages(shardIds, now)
-        if (rows.length === 0) {
-          return []
-        }
+        const nextDeliverAtRows = yield* getNextDeliverAt(shardIds, now)
         const messages: Array<{
           readonly envelope: Envelope.Encoded
           readonly lastSentReply: Option.Option<Reply.Encoded>
@@ -547,7 +663,11 @@ export const make: (options?: {
           messages[i] = messageFromRow(rows[i])
           ids[i] = String(rows[i].id)
         }
-        return messages
+        const nextDeliverAt = nextDeliverAtRows[0]?.next_deliver_at
+        return {
+          messages,
+          nextDeliverAt: nextDeliverAt == null ? null : Number(nextDeliverAt)
+        }
       },
       Effect.provideService(SqlClient.SafeIntegers, true),
       PersistenceError.refail,

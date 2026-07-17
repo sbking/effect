@@ -168,8 +168,9 @@ describe.concurrent("Sharding", () => {
         deliverAt: null
       })
 
-      // wait for storage to poll
-      yield* TestClock.adjust(5000)
+      // wait for storage to poll (the poll timer is armed relative to the
+      // last storage read, so allow up to two intervals)
+      yield* TestClock.adjust(10000)
 
       const exit = fiber.pollUnsafe()
       assert(exit && Exit.isFailure(exit) && Cause.hasDies(exit.cause))
